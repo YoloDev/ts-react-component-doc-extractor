@@ -520,7 +520,6 @@ class Parser {
       for (const prop of propsArray) {
         (props as any)[prop.name] = prop;
       }
-      Object.freeze(props);
 
       let commentSource = exp;
       if (!exp.valueDeclaration) {
@@ -529,11 +528,11 @@ class Parser {
         }
       }
 
-      return Object.freeze({
+      return {
         description: this.findDocComment(checker, commentSource).fullComment,
         displayName: componentName,
         props,
-      });
+      };
     } finally {
       this.host.removeSourceFile(exportPropsFile.fileName);
     }
