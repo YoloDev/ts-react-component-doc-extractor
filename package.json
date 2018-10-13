@@ -1,6 +1,6 @@
 {
   "name": "@yolodev/ts-react-component-doc-extractor",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Extracts docs from ts react projects",
   "main": "dist/index.js",
   "scripts": {
