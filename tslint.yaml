@@ -1,0 +1,18 @@
+defaultSeverity: error
+extends:
+  - 'tslint:latest'
+  - 'tslint-eslint-rules'
+  - 'tslint-config-prettier'
+
+rules:
+  ordered-imports: [false]
+  interface-name: [false]
+  no-unused-expression: [false]
+  no-namespace: [false]
+  no-implicit-dependencies: [true, ['bitburner']]
+  max-classes-per-file: [false]
+  member-access: [false]
+  array-type: [false]
+  no-shadowed-variable: [false]
+  no-object-literal-type-assertion: [false]
+  no-return-await: [false]

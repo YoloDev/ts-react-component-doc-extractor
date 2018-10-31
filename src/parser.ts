@@ -1,4 +1,5 @@
 import {
+  ComponentDoc,
   ParentType,
   PropItem,
   Props,
@@ -10,6 +11,7 @@ import findUp from 'find-up';
 import fs from 'fs';
 import path from 'path';
 import ts from 'typescript';
+import globby from 'globby';
 
 type PropertyFilter = (
   symbol: ts.Symbol,
@@ -61,7 +63,7 @@ const mostRoot = (files: ReadonlyArray<string>) => {
 };
 
 const hasFlag = <T extends number>(flags: T, value: T) =>
-  Boolean(flags & value);
+  Boolean(flags & value); // tslint:disable-line:no-bitwise
 
 const propsType = ts.createTypeAliasDeclaration(
   void 0,
@@ -84,7 +86,7 @@ const propsType = ts.createTypeAliasDeclaration(
         ts.createTypeReferenceNode('P', void 0),
       ],
     ),
-    //ts.createTypeReferenceNode('P', void 0),
+    // ts.createTypeReferenceNode('P', void 0),
     ts.createTypeReferenceNode('never', void 0),
   ),
 );
@@ -337,10 +339,12 @@ function getParentType(prop: ts.Symbol): ParentType | undefined {
   // }
 
   return {
-    fileName: fileName,
+    fileName,
     name: parentName,
   };
 }
+
+const notNull = <T>(value: T | null): value is T => value !== null;
 
 class Parser {
   static fromConfig(tsconfigPath: string) {
@@ -365,7 +369,7 @@ class Parser {
       throw errors[0];
     }
 
-    return new Parser(options);
+    return new Parser({ options, include: config.include });
   }
 
   static parse(filePathOrPaths: string | ReadonlyArray<string>) {
@@ -381,27 +385,36 @@ class Parser {
       parser = Parser.fromConfig(tsconfigPath);
     } else {
       parser = new Parser({
-        jsx: ts.JsxEmit.React,
-        module: ts.ModuleKind.ESNext,
-        target: ts.ScriptTarget.Latest,
+        options: {
+          jsx: ts.JsxEmit.React,
+          module: ts.ModuleKind.ESNext,
+          target: ts.ScriptTarget.Latest,
+        },
       });
     }
 
     return parser.parse(files);
   }
 
+  public propertyFilter: PropertyFilter;
+  public simplePropFilter: SimplePropertyFilter;
   private readonly host: ModifiableCompilerHost;
   private readonly options: ts.CompilerOptions;
   private readonly printer: ts.Printer;
   private readonly rootPath: string;
-  private readonly propertyFilter: PropertyFilter;
-  private readonly simplePropFilter: SimplePropertyFilter;
+  private readonly include: ReadonlyArray<string>;
   private program: ts.Program | undefined = void 0;
-  constructor(
-    options: ts.CompilerOptions,
-    propertyFilter: PropertyFilter = nullFilter,
-    simplePropFilter: SimplePropertyFilter = simpleNullFilter,
-  ) {
+  constructor({
+    options,
+    propertyFilter = nullFilter,
+    simplePropFilter = simpleNullFilter,
+    include = [],
+  }: {
+    options: ts.CompilerOptions;
+    propertyFilter?: PropertyFilter;
+    simplePropFilter?: SimplePropertyFilter;
+    include?: ReadonlyArray<string>;
+  }) {
     this.options = {
       ...options,
       module: ts.ModuleKind.ESNext,
@@ -412,15 +425,22 @@ class Parser {
     this.printer = ts.createPrinter();
     this.propertyFilter = propertyFilter;
     this.simplePropFilter = simplePropFilter;
+    this.include = Object.freeze([...(include || [])]);
   }
 
-  parse(filePathOrPaths: string | ReadonlyArray<string>) {
+  parse(filePathOrPaths: string | ReadonlyArray<string>): Array<ComponentDoc> {
     const filePaths: ReadonlyArray<string> = Array.isArray(filePathOrPaths)
       ? filePathOrPaths
       : [filePathOrPaths];
 
+    const includes = globby
+      .sync(this.include as string[], {
+        cwd: this.rootPath,
+      })
+      .map(name => path.resolve(this.rootPath, name));
+
     const program = (this.program = ts.createProgram(
-      [...filePaths],
+      [...new Set([...includes, ...filePaths])],
       this.options,
       this.host,
       this.program,
@@ -433,9 +453,9 @@ class Parser {
     }
 
     const checker = program.getTypeChecker();
-    //const extractType = getExtractType(program, checker, this.extractorPath);
+    // const extractType = getExtractType(program, checker, this.extractorPath);
 
-    return ([] as any[]).concat(
+    return ([] as Array<ComponentDoc>).concat(
       ...filePaths
         .map(filePath => program.getSourceFile(filePath))
         .filter((sourceFile): sourceFile is ts.SourceFile => sourceFile != null)
@@ -449,7 +469,7 @@ class Parser {
           return checker
             .getExportsOfModule(moduleSymbol)
             .map(exp => this.getComponentInfo(exp, sourceFile, program))
-            .filter(r => r != null);
+            .filter(notNull);
         }),
     );
   }
@@ -458,7 +478,7 @@ class Parser {
     exp: ts.Symbol,
     sourceFile: ts.SourceFile,
     program: ts.Program,
-  ) {
+  ): ComponentDoc | null {
     const exportPropsFile = makePropsExportFile(
       exp,
       sourceFile,
@@ -468,7 +488,7 @@ class Parser {
     try {
       this.host.addSourceFile(exportPropsFile.fileName, exportPropsFile.source);
       const subProgram = ts.createProgram(
-        [exportPropsFile.fileName],
+        [...program.getRootFileNames(), exportPropsFile.fileName],
         this.options,
         this.host,
         program,
@@ -486,15 +506,21 @@ class Parser {
       const exportSourceFile = subProgram.getSourceFile(
         exportPropsFile.fileName,
       );
-      if (!exportSourceFile) return null;
+      if (!exportSourceFile) {
+        return null;
+      }
       const moduleSymbol = checker.getSymbolAtLocation(exportSourceFile);
-      if (!moduleSymbol) return null;
+      if (!moduleSymbol) {
+        return null;
+      }
 
       const propsExport = checker
         .getExportsOfModule(moduleSymbol)
         .find(s => s.name === 'Props');
 
-      if (!propsExport) return null;
+      if (!propsExport) {
+        return null;
+      }
       const componentName = computeComponentName(exp, sourceFile);
       const comp = Object.freeze({
         name: componentName,
@@ -540,7 +566,7 @@ class Parser {
     //   fakeName(),
     //   make
     // )
-    //const subProgram = ts.createProgram()
+    // const subProgram = ts.createProgram()
     // if (!!exp.declarations && exp.declarations.length === 0) {
     //   return null;
     // }
@@ -598,12 +624,12 @@ class Parser {
     const parent = getParentType(symbol);
 
     return {
+      defaultValue,
+      description: jsDocComment.fullComment,
       name,
+      parent,
       required: !isOptional,
       type: { name: typeString },
-      description: jsDocComment.fullComment,
-      defaultValue,
-      parent,
     };
   }
 
