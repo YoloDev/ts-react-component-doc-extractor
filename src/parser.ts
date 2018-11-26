@@ -10,8 +10,9 @@ import {
 import findUp from 'find-up';
 import fs from 'fs';
 import path from 'path';
-import ts from 'typescript';
+import ts, { resolveProjectReferencePath } from 'typescript';
 import globby from 'globby';
+import { DocCache, IRegistry } from './cache';
 
 type PropertyFilter = (
   symbol: ts.Symbol,
@@ -146,12 +147,17 @@ const createCompilerHost = (
   });
 };
 
+interface ExportsPropFile {
+  readonly source: string;
+  readonly fileName: string;
+}
+
 const makePropsExportFile = (
   exp: ts.Symbol,
   file: ts.SourceFile,
   rootPath: string,
   printer: ts.Printer,
-): { readonly source: string; readonly fileName: string } => {
+): ExportsPropFile => {
   // TODO: Support generic symbols
   const importReact = ts.createImportDeclaration(
     void 0,
@@ -344,7 +350,32 @@ function getParentType(prop: ts.Symbol): ParentType | undefined {
   };
 }
 
+const getDefinitionFile = (symbol: ts.Symbol) => {
+  if (!symbol || !symbol.declarations || !symbol.declarations[0]) {
+    return null;
+  }
+
+  let obj: ts.Node = symbol.declarations[0];
+  while (!ts.isSourceFile(obj)) {
+    if (!obj.parent) {
+      return null;
+    }
+
+    obj = obj.parent;
+  }
+
+  return obj;
+};
+
 const notNull = <T>(value: T | null): value is T => value !== null;
+
+interface FileExports {
+  readonly file: string;
+  readonly sourceFile: ts.SourceFile;
+  readonly symbol: ts.Symbol;
+  readonly propsFile: ExportsPropFile;
+  component: ComponentDoc | null;
+}
 
 class Parser {
   static fromConfig(tsconfigPath: string) {
@@ -403,6 +434,7 @@ class Parser {
   private readonly printer: ts.Printer;
   private readonly rootPath: string;
   private readonly include: ReadonlyArray<string>;
+  private readonly cache: DocCache = new DocCache();
   private program: ts.Program | undefined = void 0;
   constructor({
     options,
@@ -433,14 +465,23 @@ class Parser {
       ? filePathOrPaths
       : [filePathOrPaths];
 
+    return ([] as Array<ComponentDoc>).concat(
+      ...filePaths.map(file =>
+        this.cache.getOrAdd(file, (reg, file) => this.populate(reg, file)),
+      ),
+    );
+  }
+
+  populate(reg: IRegistry, file: string): void {
     const includes = globby
       .sync(this.include as string[], {
         cwd: this.rootPath,
       })
       .map(name => path.resolve(this.rootPath, name));
 
+    const files = [...new Set([...includes, file])];
     const program = (this.program = ts.createProgram(
-      [...new Set([...includes, ...filePaths])],
+      files,
       this.options,
       this.host,
       this.program,
@@ -453,160 +494,142 @@ class Parser {
     }
 
     const checker = program.getTypeChecker();
-    // const extractType = getExtractType(program, checker, this.extractorPath);
+    const fileExports: FileExports[] = [];
+    for (const f of files) {
+      const sourceFile = program.getSourceFile(f);
+      if (!sourceFile) {
+        continue;
+      }
 
-    return ([] as Array<ComponentDoc>).concat(
-      ...filePaths
-        .map(filePath => program.getSourceFile(filePath))
-        .filter((sourceFile): sourceFile is ts.SourceFile => sourceFile != null)
-        .map(sourceFile => {
-          const moduleSymbol = checker.getSymbolAtLocation(sourceFile);
+      const moduleSymbol = checker.getSymbolAtLocation(sourceFile);
+      if (!moduleSymbol) {
+        continue;
+      }
 
-          if (!moduleSymbol) {
-            return [];
-          }
+      const moduleExports = checker.getExportsOfModule(moduleSymbol);
+      for (const exportSymbol of moduleExports) {
+        const definitionFile = getDefinitionFile(exportSymbol);
+        if (definitionFile && definitionFile !== sourceFile) {
+          continue;
+        }
 
-          return checker
-            .getExportsOfModule(moduleSymbol)
-            .map(exp => this.getComponentInfo(exp, sourceFile, program))
-            .filter(notNull);
-        }),
-    );
-  }
+        fileExports.push({
+          component: null,
+          file: f,
+          propsFile: makePropsExportFile(
+            exportSymbol,
+            sourceFile,
+            this.rootPath,
+            this.printer,
+          ),
+          sourceFile,
+          symbol: exportSymbol,
+        });
+      }
+    }
 
-  getComponentInfo(
-    exp: ts.Symbol,
-    sourceFile: ts.SourceFile,
-    program: ts.Program,
-  ): ComponentDoc | null {
-    const exportPropsFile = makePropsExportFile(
-      exp,
-      sourceFile,
-      this.rootPath,
-      this.printer,
-    );
     try {
-      this.host.addSourceFile(exportPropsFile.fileName, exportPropsFile.source);
+      fileExports.forEach(s =>
+        this.host.addSourceFile(s.propsFile.fileName, s.propsFile.source),
+      );
+
       const subProgram = ts.createProgram(
-        [...program.getRootFileNames(), exportPropsFile.fileName],
+        [
+          ...program.getRootFileNames(),
+          ...fileExports.map(f => f.propsFile.fileName),
+        ],
         this.options,
         this.host,
         program,
       );
 
-      const diagnostics = ts.getPreEmitDiagnostics(subProgram);
-      if (diagnostics.some(d => d.category === ts.DiagnosticCategory.Error)) {
-        // const msg = ts.formatDiagnostics(diagnostics, this.host);
-        // console.log(exportPropsFile.source);
-        // throw new Error(`Compile failed:\n${msg}`);
-        return null;
-      }
-
       const checker = subProgram.getTypeChecker();
-      const exportSourceFile = subProgram.getSourceFile(
-        exportPropsFile.fileName,
-      );
-      if (!exportSourceFile) {
-        return null;
-      }
-      const moduleSymbol = checker.getSymbolAtLocation(exportSourceFile);
-      if (!moduleSymbol) {
-        return null;
-      }
+      for (const fileExport of fileExports) {
+        const exportSourceFile = subProgram.getSourceFile(
+          fileExport.propsFile.fileName,
+        );
 
-      const propsExport = checker
-        .getExportsOfModule(moduleSymbol)
-        .find(s => s.name === 'Props');
-
-      if (!propsExport) {
-        return null;
-      }
-      const componentName = computeComponentName(exp, sourceFile);
-      const comp = Object.freeze({
-        name: componentName,
-      });
-      const type = checker.getDeclaredTypeOfSymbol(propsExport);
-      const propsArray = type
-        .getProperties()
-        .map(s => {
-          const symbolType = checker.getTypeOfSymbolAtLocation(
-            s,
-            s.valueDeclaration || s.declarations[0],
-          );
-          return {
-            symbol: s,
-            type: symbolType,
-          };
-        })
-        .filter(({ symbol, type }) => this.propertyFilter(symbol, type, exp))
-        .map(prop => this.getPropInfo(checker, prop.symbol, prop.type))
-        .filter(prop => this.simplePropFilter(prop, comp));
-
-      const props: Props = {};
-      for (const prop of propsArray) {
-        (props as any)[prop.name] = prop;
-      }
-
-      let commentSource = exp;
-      if (!exp.valueDeclaration) {
-        if (hasFlag(exp.getFlags(), ts.SymbolFlags.Alias)) {
-          commentSource = checker.getAliasedSymbol(commentSource);
+        if (!exportSourceFile) {
+          continue;
         }
+
+        const diagnostics = ts.getPreEmitDiagnostics(
+          subProgram,
+          exportSourceFile,
+        );
+        if (diagnostics.some(d => d.category === ts.DiagnosticCategory.Error)) {
+          continue;
+        }
+
+        const moduleSymbol = checker.getSymbolAtLocation(exportSourceFile);
+        if (!moduleSymbol) {
+          continue;
+        }
+
+        const propsExport = checker
+          .getExportsOfModule(moduleSymbol)
+          .find(s => s.name === 'Props');
+
+        if (!propsExport) {
+          continue;
+        }
+        const componentName = computeComponentName(
+          fileExport.symbol,
+          fileExport.sourceFile,
+        );
+        const comp = Object.freeze({
+          name: componentName,
+        });
+        const type = checker.getDeclaredTypeOfSymbol(propsExport);
+        const propsArray = type
+          .getProperties()
+          .map(s => {
+            const symbolType = checker.getTypeOfSymbolAtLocation(
+              s,
+              s.valueDeclaration || s.declarations[0],
+            );
+            return {
+              symbol: s,
+              type: symbolType,
+            };
+          })
+          .filter(({ symbol, type }) =>
+            this.propertyFilter(symbol, type, fileExport.symbol),
+          )
+          .map(prop => this.getPropInfo(checker, prop.symbol, prop.type))
+          .filter(prop => this.simplePropFilter(prop, comp));
+
+        const props: Props = {};
+        for (const prop of propsArray) {
+          (props as any)[prop.name] = prop;
+        }
+
+        let commentSource = fileExport.symbol;
+        if (!fileExport.symbol.valueDeclaration) {
+          if (hasFlag(fileExport.symbol.getFlags(), ts.SymbolFlags.Alias)) {
+            commentSource = checker.getAliasedSymbol(commentSource);
+          }
+        }
+
+        fileExport.component = {
+          description: this.findDocComment(checker, commentSource).fullComment,
+          displayName: componentName,
+          props,
+        };
       }
-
-      return {
-        description: this.findDocComment(checker, commentSource).fullComment,
-        displayName: componentName,
-        props,
-      };
     } finally {
-      this.host.removeSourceFile(exportPropsFile.fileName);
+      fileExports.forEach(s =>
+        this.host.removeSourceFile(s.propsFile.fileName),
+      );
     }
-    // const typeExportFile = ts.createSourceFile(
-    //   fakeName(),
-    //   make
-    // )
-    // const subProgram = ts.createProgram()
-    // if (!!exp.declarations && exp.declarations.length === 0) {
-    //   return null;
-    // }
 
-    // const isTypeAlias = hasFlag(exp.flags, ts.SymbolFlags.TypeAlias);
-    // const isAlias = hasFlag(exp.flags, ts.SymbolFlags.Alias);
-    // const isFunction = hasFlag(exp.flags, ts.SymbolFlags.Function);
-    // const isClass = hasFlag(exp.flags, ts.SymbolFlags.Class);
-    // return {
-    //   name: checker.getFullyQualifiedName(exp),
-    //   isTypeAlias,
-    //   isAlias,
-    //   isFunction,
-    //   isClass,
-    // };
-    // const type = checker.getTypeOfSymbolAtLocation(
-    //   exp,
-    //   exp.valueDeclaration || exp.declarations![0],
-    // );
-
-    // const symbol = type.symbol;
-    // const aliasSymbol = type.aliasSymbol;
-    // if (!symbol && !aliasSymbol) return null;
-
-    // const propsTypeSymbol = this.getPropsTypeSymbol(
-    //   symbol || aliasSymbol,
-    //   checker,
-    //   program,
-    // );
-    // return propsTypeSymbol;
-
-    // const sfqn = symbol && checker.getFullyQualifiedName(symbol);
-    // const afqn = aliasSymbol && checker.getFullyQualifiedName(aliasSymbol);
-    // return {
-    //   symbol,
-    //   aliasSymbol,
-    //   sfqn,
-    //   afqn,
-    //   name: symbol && symbol.getName(),
-    // };
+    for (const sourceFile of this.program.getSourceFiles()) {
+      const docs = fileExports
+        .filter(f => f.sourceFile === sourceFile)
+        .map(f => f.component)
+        .filter(notNull);
+      reg.registerFile(sourceFile.fileName, docs);
+    }
   }
 
   getPropInfo(
